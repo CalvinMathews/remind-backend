@@ -147,15 +147,9 @@ async def invoke_agent(user_input: UserInput):
         response = agent_executor.invoke({"input": input_with_context})
         text_output = response.get('output', 'Agent failed to produce a final output.')
         
-        return {
-            "id": str(datetime.utcnow().timestamp()),
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": text_output
-                }
-            ]
-        }
+        # ** THIS IS THE CRITICAL FIX **
+        # We now return the simple JSON object that the frontend expects.
+        return {"output": text_output}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent invocation failed: {e}")
