@@ -1,9 +1,8 @@
 fastapi
-uvicorn
+uvicorn[standard]
 python-dotenv
 supabase
 langchain
 langchain-groq
 langchain-openai
-numpy
-fastapi-cors
+httpx
