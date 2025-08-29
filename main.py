@@ -9,8 +9,15 @@ from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.tools import tool
+from fastapi.middleware.cors import CORSMiddleware
 from langchain_openai import OpenAIEmbeddings
-
+api.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 # ====== 2. INITIALIZE SERVICES ======
 # Load API keys from environment variables set in the hosting service.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
