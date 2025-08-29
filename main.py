@@ -11,13 +11,14 @@ from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.tools import tool
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_openai import OpenAIEmbeddings
-api.add_middleware(
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
 # ====== 2. INITIALIZE SERVICES ======
 # Load API keys from environment variables set in the hosting service.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
