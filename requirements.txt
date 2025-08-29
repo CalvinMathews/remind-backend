@@ -1,8 +1,8 @@
-fastapi
-uvicorn[standard]
-python-dotenv
-supabase
-langchain
-langchain-groq
-langchain-openai
-httpx
+fastapi==0.112.2
+uvicorn==0.30.6
+supabase==2.6.0
+pydantic==2.9.0
+python-dateutil==2.9.0.post0
+dateparser==1.2.0
+groq==0.9.0
+httpx==0.27.0
