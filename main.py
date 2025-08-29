@@ -1,229 +1,232 @@
-# ====== 1. IMPORTS AND SETUP ======
-import os
-from typing import Optional
-from datetime import datetime
-
-from fastapi import FastAPI, HTTPException
+import os, json, re, uuid, datetime
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-
 from supabase import create_client, Client
+from groq import Groq
+import dateparser
 
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.tools import tool
+# --- Environment ---
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
-from langchain_openai import OpenAIEmbeddings
+# OPTIONAL: default sender email to show in confirmations (purely UI)
+DEFAULT_SENDER = os.environ.get("REMIND_SENDER_EMAIL", "[email protected]")
 
+# --- Init clients ---
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+groq = Groq(api_key=GROQ_API_KEY)
 
-# ====== 2. CONFIGURE API SERVER ======
-app = FastAPI(title="Re:Mind Backend")
+app = FastAPI(title="Re:Mind Backend", version="1.0")
 
-# Minimal, correct CORS: wildcard origins only if no credentials.
-# In production, set FRONTEND_ORIGIN to your Vercel URL and switch to that.
-FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "")
-allowed_origins = [FRONTEND_ORIGIN] if FRONTEND_ORIGIN else ["*"]
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,                 # keep False if using "*"
-    allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-
-# ====== 3. INITIALIZE SERVICES ======
-# Load API keys from environment variables
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")  # service role key (server-side only)
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "dummy-key")  # ensure you set this in Render
-
-if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY")
-
-if not GROQ_API_KEY:
-    raise RuntimeError("Missing GROQ_API_KEY")
-
-try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-    # Keep your original Groq model string (works for you)
-    llm = ChatGroq(model="llama3-70b-8192", temperature=0, api_key=GROQ_API_KEY)
-
-    # Keep OpenAIEmbeddings (1536-dim). Be explicit on model to avoid surprises.
-    # text-embedding-3-small -> 1536 dims
-    embeddings = OpenAIEmbeddings(api_key=OPENAI_API_KEY, model="text-embedding-3-small")
-except Exception as e:
-    raise RuntimeError(f"Failed to initialize external services: {e}")
-
-
-# Pydantic model for incoming API requests
-class UserInput(BaseModel):
-    user_id: str
+# === Pydantic models ===
+class ChatRequest(BaseModel):
+    user_id: str                  # Supabase user id (from frontend after login)
     message: str
+    now_iso: Optional[str] = None # current time from client (optional)
+    tz: Optional[str] = None      # e.g., "Asia/Kolkata" (optional)
 
-
-# ====== 4. DEFINE AGENT TOOLS (SKILLS) ======
-@tool
-def add_task(user_id: str, task_description: str, due_date: Optional[str] = None):
-    """Adds a new to-do item. Requires user_id and task_description. Optional due_date (ISO)."""
+# helper: parse date/time like "tomorrow 2pm"
+def parse_datetime(text: str, now: Optional[str] = None, tz: Optional[str] = None) -> Optional[str]:
+    settings = {"PREFER_DATES_FROM": "future"}
+    if tz: settings["TIMEZONE"] = tz
+    if now:
+        dt = dateparser.parse(text, settings=settings, languages=["en"], RELATIVE_BASE=datetime.datetime.fromisoformat(now.replace("Z","+00:00")))
+    else:
+        dt = dateparser.parse(text, settings=settings, languages=["en"])
+    if not dt: return None
+    # normalize to ISO UTC
+    if not dt.tzinfo:
+        dt = dt.astimezone(datetime.timezone.utc) if hasattr(dt, "astimezone") else dt
     try:
-        todo_item = {"task": task_description, "user_id": user_id, "is_completed": False}
-        if due_date:
-            iso = due_date.replace("Z", "+00:00")
-            todo_item["due_date"] = datetime.fromisoformat(iso).isoformat()
+        dt_utc = dt.astimezone(datetime.timezone.utc)
+    except Exception:
+        dt_utc = dt
+    return dt_utc.replace(microsecond=0).isoformat().replace("+00:00","Z")
 
-        response = supabase.table('todos').insert(todo_item).execute()
-        return "Successfully added task." if response.data else f"Error adding task: {response.error}"
-    except Exception as e:
-        return f"Error: {e}"
+# --- DB helpers ---
+def add_task(user_id: str, title: str, description: Optional[str], due_at_iso: Optional[str], source_text: str) -> Dict[str, Any]:
+    payload = {
+        "user_id": user_id,
+        "title": title.strip(),
+        "description": (description or "").strip() or None,
+        "due_at": due_at_iso,
+        "source_text": source_text
+    }
+    res = supabase.table("tasks").insert(payload).execute()
+    task = res.data[0]
+    # create reminder if due_at provided
+    if due_at_iso:
+        supabase.table("reminders").insert({
+            "task_id": task["id"], "remind_at": due_at_iso, "method": "email"
+        }).execute()
+    return task
 
+def update_task(user_id: str, title_contains: str, new_title: Optional[str]=None, new_due_at_iso: Optional[str]=None, new_status: Optional[str]=None) -> Dict[str, Any]:
+    # find latest matching OPEN task by title substring
+    q = supabase.table("tasks").select("*").eq("user_id", user_id).eq("status", "open").order("created_at", desc=True).execute()
+    matches = [t for t in q.data if title_contains.lower() in t["title"].lower()]
+    if not matches: raise HTTPException(404, "Task not found")
+    task = matches[0]
+    update = {}
+    if new_title: update["title"] = new_title
+    if new_status: update["status"] = new_status
+    if new_due_at_iso is not None: update["due_at"] = new_due_at_iso
+    if update:
+        update["updated_at"] = datetime.datetime.utcnow().isoformat()+"Z"
+        supabase.table("tasks").update(update).eq("id", task["id"]).execute()
+    # refresh
+    task = supabase.table("tasks").select("*").eq("id", task["id"]).single().execute().data
+    # manage reminder row
+    if new_due_at_iso is not None:
+        # upsert reminder for this task: delete old pending, insert new
+        supabase.table("reminders").delete().eq("task_id", task["id"]).eq("sent", False).execute()
+        if new_due_at_iso:
+            supabase.table("reminders").insert({
+                "task_id": task["id"], "remind_at": new_due_at_iso, "method": "email"
+            }).execute()
+    return task
 
-@tool
-def get_tasks(user_id: str):
-    """Retrieves all of a user's active to-do items. Requires user_id."""
+def delete_task(user_id: str, title_contains: str) -> int:
+    q = supabase.table("tasks").select("id,title").eq("user_id", user_id).order("created_at", desc=True).execute()
+    matches = [t for t in q.data if title_contains.lower() in t["title"].lower()]
+    if not matches: raise HTTPException(404, "Task not found")
+    tid = matches[0]["id"]
+    supabase.table("tasks").delete().eq("id", tid).execute()
+    return 1
+
+def list_tasks(user_id: str, when: Optional[str]=None) -> List[Dict[str, Any]]:
+    query = supabase.table("tasks").select("*").eq("user_id", user_id).order("due_at", desc=False)
+    if when == "today":
+        today = datetime.datetime.utcnow().date()
+        start = datetime.datetime.combine(today, datetime.time.min, tzinfo=datetime.timezone.utc).isoformat().replace("+00:00","Z")
+        end   = datetime.datetime.combine(today, datetime.time.max, tzinfo=datetime.timezone.utc).isoformat().replace("+00:00","Z")
+        query = query.gte("due_at", start).lte("due_at", end)
+    res = query.execute()
+    return res.data or []
+
+def store_memory(user_id: str, label: Optional[str], content: str) -> Dict[str, Any]:
+    res = supabase.table("memories").insert({"user_id": user_id, "label": label, "content": content}).execute()
+    return res.data[0]
+
+def recall_memory(user_id: str, question: Optional[str], label_contains: Optional[str]) -> Optional[Dict[str, Any]]:
+    q = supabase.table("memories").select("*").eq("user_id", user_id).order("created_at", desc=True).execute().data
+    if label_contains:
+        for m in q:
+            if m["label"] and label_contains.lower() in m["label"].lower():
+                return m
+    if question:
+        # naive contains search in content
+        for m in q:
+            if question.lower() in (m["content"] or "").lower():
+                return m
+    return q[0] if q else None
+
+# --- LLM intent extraction (JSON schema) ---
+SYSTEM = """You are Re:Mind's planner. Convert user messages into a single JSON command.
+Schema:
+{ "action": "add_task|update_task|delete_task|list_tasks|store_memory|recall_memory|help",
+  "title": "...", "description": "...", "when": "...", "status": "open|done|cancelled",
+  "label": "...", "question": "...", "match": "substring to find existing task"
+}
+Rules:
+- If user says "remember ...", use store_memory with label derived and content=verbatim memory.
+- If user asks a question about a memory (e.g., 'Where is my passport?'), use recall_memory with question.
+- For "add ..." with time like 'tomorrow 8am', put natural time in "when".
+- For updates like 'change buy milk to 9am' use update_task with match="buy milk" and when="9am".
+- For 'what are my tasks for today', use list_tasks with when="today".
+Output ONLY the JSON. No commentary.
+"""
+
+def llm_to_json(user_msg: str) -> Dict[str, Any]:
+    resp = groq.chat.completions.create(
+        model="llama-3.1-70b-versatile",
+        messages=[{"role":"system","content":SYSTEM},{"role":"user","content":user_msg}],
+        temperature=0.1,
+    )
+    text = resp.choices[0].message.content.strip()
+    # try to extract JSON
+    m = re.search(r"\{[\s\S]*\}", text)
+    if not m:
+        return {"action":"help"}
     try:
-        response = (
-            supabase.table('todos')
-            .select('id, task, due_date')
-            .eq('user_id', user_id)
-            .eq('is_completed', False)
-            .order('due_date', desc=False)
-            .execute()
-        )
-        rows = response.data or []
-        if not rows:
-            return "You have no active tasks."
-        formatted = []
-        for r in rows:
-            due = r.get("due_date")
-            due_txt = f" (due {due})" if due else ""
-            formatted.append(f"- '{r['task']}' (ID: {r['id']}){due_txt}")
-        return "Current tasks:\n" + "\n".join(formatted)
-    except Exception as e:
-        return f"Error: {e}"
+        return json.loads(m.group(0))
+    except Exception:
+        return {"action":"help"}
 
+# --- Chat endpoint ---
+@app.post("/chat")
+def chat(req: ChatRequest):
+    user_id = req.user_id
+    cmd = llm_to_json(req.message)
 
-@tool
-def update_task(
-    user_id: str,
-    task_id: int,
-    new_description: Optional[str] = None,
-    new_due_date: Optional[str] = None,
-    is_completed: Optional[bool] = None
-):
-    """Updates an existing to-do item. Requires user_id and task_id."""
-    try:
-        updates = {}
-        if new_description is not None:
-            updates["task"] = new_description
-        if new_due_date is not None:
-            iso = new_due_date.replace("Z", "+00:00")
-            updates["due_date"] = datetime.fromisoformat(iso).isoformat()
-        if is_completed is not None:
-            updates["is_completed"] = is_completed
+    action = cmd.get("action","help")
+    now_iso = req.now_iso
+    tz = req.tz
 
-        if not updates:
-            return "Error: No update information provided."
+    if action == "add_task":
+        title = cmd.get("title") or cmd.get("match") or req.message
+        description = cmd.get("description")
+        when_text = cmd.get("when")
+        due = parse_datetime(when_text, now=now_iso, tz=tz) if when_text else None
+        task = add_task(user_id, title, description, due, req.message)
+        confirm_time = f" at {due}" if due else ""
+        return {"reply": f"✅ Added: “{task['title']}”{confirm_time}."}
 
-        response = (
-            supabase.table('todos')
-            .update(updates)
-            .eq('user_id', user_id)
-            .eq('id', task_id)
-            .execute()
-        )
-        return "Task updated successfully." if response.data else "Failed to update task. Check task_id."
-    except Exception as e:
-        return f"Error: {e}"
+    if action == "update_task":
+        match = cmd.get("match") or cmd.get("title") or ""
+        new_title = cmd.get("title") if cmd.get("title") and cmd.get("title") != match else None
+        new_status = cmd.get("status")
+        when_text = cmd.get("when")
+        new_due = parse_datetime(when_text, now=now_iso, tz=tz) if when_text else None if when_text is not None else None
+        task = update_task(user_id, match, new_title=new_title, new_due_at_iso=new_due, new_status=new_status)
+        return {"reply": f"✏️ Updated: “{task['title']}”.", "task": task}
 
+    if action == "delete_task":
+        match = cmd.get("match") or cmd.get("title") or ""
+        delete_task(user_id, match)
+        return {"reply": f"🗑️ Deleted task matching “{match}”. (Most recent match removed)."}
 
-@tool
-def delete_task(user_id: str, task_id: int):
-    """Deletes a to-do item. Requires user_id and task_id. Use get_tasks to find the task_id first."""
-    try:
-        response = (
-            supabase.table('todos')
-            .delete()
-            .eq('user_id', user_id)
-            .eq('id', task_id)
-            .execute()
-        )
-        return "Task deleted successfully." if response.data else "Failed to delete task. Check task_id."
-    except Exception as e:
-        return f"Error: {e}"
+    if action == "list_tasks":
+        when = cmd.get("when")
+        tasks = list_tasks(user_id, when=when)
+        if not tasks: return {"reply":"No tasks found."}
+        lines = []
+        for t in tasks:
+            due = t["due_at"]
+            due_str = f" — {due}" if due else ""
+            lines.append(f"• {t['title']}{due_str} [{t['status']}]")
+        title = "Today’s tasks" if when == "today" else "Your tasks"
+        return {"reply": f"**{title}**\n" + "\n".join(lines)}
 
+    if action == "store_memory":
+        # derive a label (simple heuristic)
+        label = cmd.get("label")
+        content = cmd.get("content") or cmd.get("description") or req.message
+        if not label:
+            # e.g., "wife favorite flower"
+            label = "memory"
+        m = store_memory(user_id, label, content)
+        return {"reply": f"🧠 Saved memory: {label}."}
 
-@tool
-def store_memory(user_id: str, text_content: str):
-    """Stores a piece of information as a memory. For remembering facts, not tasks."""
-    try:
-        embedding = embeddings.embed_query(text_content)  # 1536-dim vector
-        response = (
-            supabase.table('memories')
-            .insert({"content": text_content, "embedding": embedding, "user_id": user_id})
-            .execute()
-        )
-        return "OK, I've stored that memory." if response.data else f"Error storing memory: {response.error}"
-    except Exception as e:
-        return f"Error: {e}"
+    if action == "recall_memory":
+        question = cmd.get("question") or req.message
+        label_contains = cmd.get("label")
+        m = recall_memory(user_id, question, label_contains)
+        if not m: return {"reply":"I couldn’t find a related memory."}
+        return {"reply": f"🔎 Memory: {m['content']}"}
 
+    # suggestions (simple LLM text)
+    if action == "help":
+        suggestion = groq.chat.completions.create(
+            model="llama-3.1-70b-versatile",
+            messages=[{"role":"system","content":"Suggest helpful next actions for a personal task manager."},
+                      {"role":"user","content":req.message}],
+            temperature=0.5,
+        ).choices[0].message.content
+        return {"reply": suggestion}
 
-@tool
-def recall_memory(user_id: str, search_query: str):
-    """Searches memories to answer a user's question."""
-    try:
-        qvec = embeddings.embed_query(search_query)  # 1536-dim
-        # Minimal, correct RPC call: arguments must match the SQL function signature; no .eq() chaining
-        res = supabase.rpc(
-            'match_memories',
-            {'user_id': user_id, 'query_embedding': qvec, 'match_count': 1}
-        ).execute()
-        rows = res.data or []
-        return f"Found a relevant memory: '{rows[0]['content']}'" if rows else \
-               "I don't have a memory that matches that question."
-    except Exception as e:
-        return f"Error: {e}"
-
-
-# ====== 5. CREATE AGENT AND EXECUTOR ======
-tools = [add_task, get_tasks, update_task, delete_task, store_memory, recall_memory]
-
-agent_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are Re:Mind, a helpful assistant. "
-               "If text is a memory (e.g., 'remember ...'), call store_memory. "
-               "If it's a task (add/read/update/delete), call the appropriate tool. "
-               "Infer natural-language dates when you can; if unsure, ask briefly. "
-               "Never invent task IDs—list first to identify."),
-    MessagesPlaceholder(variable_name="chat_history", optional=True),
-    ("human", "{input}"),
-    MessagesPlaceholder(variable_name="agent_scratchpad"),
-])
-
-agent = create_tool_calling_agent(llm, tools, agent_prompt)
-agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-
-# ====== 6. DEFINE API ENDPOINTS ======
-@app.get("/", tags=["Status"])
-def read_root():
-    return {"status": "Re:Mind backend is running"}
-
-
-@app.post("/invoke", tags=["Agent"])
-async def invoke_agent(user_input: UserInput):
-    """Main endpoint to process user messages via the LangChain agent."""
-    if not user_input.user_id or not user_input.message:
-        raise HTTPException(status_code=400, detail="user_id and message are required.")
-
-    input_with_context = f"My user_id is '{user_input.user_id}'. The user's request is: '{user_input.message}'"
-
-    try:
-        response = agent_executor.invoke({"input": input_with_context})
-        text_output = response.get('output', 'Agent failed to produce a final output.')
-        # Keep response shape consistent with the frontend expectation
-        return {"reply": text_output}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Agent invocation failed: {e}")
+@app.get("/health")
+def health():
+    return {"ok": True, "service": "remind-backend"}
