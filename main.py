@@ -11,6 +11,12 @@ from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.tools import tool
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_openai import OpenAIEmbeddings
+
+# ====== 2. CONFIGURE API SERVER ======
+# THIS BLOCK IS MOVED TO THE TOP
+app = FastAPI(title="Re:Mind Backend")
+
+# THIS BLOCK IS MOVED UP and now it works because 'app' is defined.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ====== 2. INITIALIZE SERVICES ======
+# ====== 3. INITIALIZE SERVICES ======
 # Load API keys from environment variables set in the hosting service.
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
@@ -39,8 +45,8 @@ class UserInput(BaseModel):
     user_id: str
     message: str
 
-# ====== 3. DEFINE AGENT TOOLS (SKILLS) ======
-# These are the functions the AI agent can execute to perform actions.
+# ====== 4. DEFINE AGENT TOOLS (SKILLS) ======
+# All your tool functions (@tool) go here. They are correct.
 
 @tool
 def add_task(user_id: str, task_description: str, due_date: Optional[str] = None):
@@ -110,12 +116,12 @@ def recall_memory(user_id: str, search_query: str):
     except Exception as e:
         return f"Error: {e}"
 
-# ====== 4. CREATE AGENT AND EXECUTOR ======
+
+# ====== 5. CREATE AGENT AND EXECUTOR ======
 tools = [add_task, get_tasks, update_task, delete_task, store_memory, recall_memory]
 
-# The agent's core instructions and personality.
 agent_prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are Re:Mind, a helpful assistant. Use your tools to manage the user's to-do lists and memories. For updates or deletes, you MUST use get_tasks first to find the correct task_id."),
+    ("system", "You are Re:Mind, a helpful assistant..."), # Your prompt is correct
     MessagesPlaceholder(variable_name="chat_history", optional=True),
     ("human", "{input}"),
     MessagesPlaceholder(variable_name="agent_scratchpad"),
@@ -124,9 +130,7 @@ agent_prompt = ChatPromptTemplate.from_messages([
 agent = create_tool_calling_agent(llm, tools, agent_prompt)
 agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
 
-# ====== 5. CONFIGURE API SERVER ======
-app = FastAPI(title="Re:Mind Backend")
-
+# ====== 6. DEFINE API ENDPOINTS ======
 @app.get("/", tags=["Status"])
 def read_root():
     return {"status": "Re:Mind backend is running"}
@@ -137,7 +141,6 @@ async def invoke_agent(user_input: UserInput):
     if not all([user_input.user_id, user_input.message]):
         raise HTTPException(status_code=400, detail="user_id and message are required.")
     
-    # Provide the agent with necessary context for tool usage.
     input_with_context = f"My user_id is '{user_input.user_id}'. The user's request is: '{user_input.message}'"
     
     try:
