@@ -145,6 +145,17 @@ async def invoke_agent(user_input: UserInput):
     
     try:
         response = agent_executor.invoke({"input": input_with_context})
-        return {"output": response.get('output', 'Agent failed to produce a final output.')}
+        text_output = response.get('output', 'Agent failed to produce a final output.')
+        
+        return {
+            "id": str(datetime.utcnow().timestamp()),
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": text_output
+                }
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Agent invocation failed: {e}")
